@@ -969,12 +969,12 @@ class SNRTextCheck(AuditRule):
 
 
 class ChartColorCheck(AuditRule):
-    """图表颜色校验 — 分析热力图图例(标尺)颜色，确认阈值颜色设定正确"""
+    """图表颜色校验 — 确认报告包含 VISUALIZATION STATISTICS 截图"""
 
     def __init__(self, filepath=None):
         super().__init__(
             '图表颜色校验',
-            '分析热力图图例颜色，确认 ≥-65dBm / ≥25dB 在标尺上显示为绿色'
+            '确认 VISUALIZATION STATISTICS 截图已包含各章节覆盖数据'
         )
         self.filepath = filepath
 
@@ -985,64 +985,132 @@ class ChartColorCheck(AuditRule):
         if not self.filepath:
             return False, ['❌ 未提供文件路径，无法分析图表']
         try:
-            heatmaps = self._extract_heatmap_images(self.filepath)
-        except ImportError:
-            return False, ['⚠️  需要安装 Pillow 库: pip3 install Pillow']
+            vs_images = self._extract_vs_images(self.filepath)
         except Exception as e:
             return False, [f'❌ 图表分析失败: {e}']
-        if not heatmaps:
-            return False, ['ℹ️  未在报告中找到热力图']
+        if not vs_images:
+            return False, ['ℹ️  未在报告中找到 VISUALIZATION STATISTICS 截图']
         findings, all_ok = [], True
-        for hm in heatmaps:
-            label = hm['label']; legend = hm['legend']; main = hm['main']
-            has_green = legend.get('has_green', False)
-            has_red = legend.get('has_red', False)
-            has_yo = legend.get('has_yellow_orange', False)
-            is_signal = '信号' in label; is_snr = 'SNR' in label
-            if is_signal:
-                if has_green and not has_red:
-                    findings.append(f'✅ {label}: 标尺全绿，≥-65dBm 显示正确')
-                elif has_green and has_red:
-                    findings.append(f'✅ {label}: 标尺红→绿渐变，≥-65dBm 为绿色 ✓')
+
+        sec_map = {
+            'SIGNAL_TOTAL': '📶 Signal Strength (total coverage)',
+            'SIGNAL_SSID':  '📶 Signal Strength for SSID "MarriottBonvoy"',
+            'SNR_SSID':     '📶 SNR for SSID "MarriottBonvoy"',
+        }
+
+        for sec_key, sec_label in sec_map.items():
+            items = vs_images.get(sec_key, {})
+            findings.append(f'{sec_label}')
+            for band in ('2.4G', '5G'):
+                img_data = items.get(band)
+                if not img_data:
+                    findings.append(f'  ⚠️ [{band}] 未检测到 VISUALIZATION STATISTICS 截图')
+                    all_ok = False
+                    continue
+
+                # 分析 VISUALIZATION STATISTICS 截图中热力图区域的灰色不达标像素
+                gray_pct = self._analyze_vs_gray(img_data['img'], img_data['size'])
+
+                if gray_pct >= 3.0:
+                    all_ok = False
+                    findings.append(f'  ❌ [{band}] 存在 {gray_pct:.0f}% 灰色不达标区域（低于阈值）')
                 else:
-                    all_ok = False; findings.append(f'❌ {label}: 标尺无绿色区域')
-            elif is_snr:
-                if has_green and not has_red:
-                    findings.append(f'✅ {label}: 标尺全绿，≥25dB 显示正确')
-                elif has_green and has_red:
-                    findings.append(f'✅ {label}: 标尺红→绿渐变，≥25dB 为绿色 ✓')
-                else:
-                    all_ok = False; findings.append(f'❌ {label}: 标尺无绿色区域')
-            else:
-                if has_green:
-                    findings.append(f'✅ {label}: 标尺颜色正确')
-                else:
-                    findings.append(f'⚠️  {label}: 标尺颜色待确认')
-            if has_red and has_yo and has_green:
-                findings.append(f'   └ 渐变完整: 红→黄→绿')
-            elif has_red and has_green:
-                findings.append(f'   └ 渐变: 红→绿')
-            elif has_green and not has_red:
-                findings.append(f'   └ 标尺全绿，覆盖质量好')
+                    findings.append(f'  ✅ [{band}] 满足覆盖要求')
+            findings.append('')
+
         return all_ok, findings
 
-    def _extract_heatmap_images(self, filepath):
-        """解析 DOCX 文档结构，提取 SSID 信号和 SNR 章节下的热力图"""
-        from PIL import Image; import io
+    def _analyze_vs_gray(self, img, size):
+        """在 VISUALIZATION STATISTICS 截图的热力图区域内检测灰色不达标像素"""
+        w, h = size
+        rgba = img.convert('RGBA')
+        pixels = list(rgba.getdata())
+        rows = [pixels[i*w:(i+1)*w] for i in range(h)]
+
+        # 步骤1：找热力图区域（绿色覆盖层密集的区域 = 楼层平面图）
+        # 扫描找到绿色像素密集的列范围（排除右侧统计面板）
+        green_cols = []
+        for x in range(0, w, 4):
+            green_count = 0
+            for y in range(0, h, 4):
+                px = rows[y][x]
+                if len(px) >= 3:
+                    r, g, b = px[0], px[1], px[2]
+                    a = px[3] if len(px) > 3 else 255
+                    if a < 128: continue
+                    # 绿色热力图覆盖层
+                    if g > r+15 and g > b+15 and g > 120:
+                        green_count += 1
+            if green_count > 5:  # 该列有足够多绿色像素
+                green_cols.append(x)
+
+        if not green_cols:
+            # 没有绿色热力图，整图分析
+            left, right, top, bottom = 0, w, 0, h
+        else:
+            # 绿色区域的范围（左侧热力图），排除右侧统计面板
+            left = max(0, min(green_cols) - 20)
+            right = min(w, max(green_cols) + 20)
+            # 再缩右边 50px 排除色标尺的灰色段
+            right = max(left, right - 50)
+            # 也找绿色行范围
+            # 也找绿色行范围
+            green_rows = []
+            for y in range(0, h, 4):
+                for x in range(left, right, 4):
+                    px = rows[y][x]
+                    if len(px) >= 3:
+                        r, g, b = px[0], px[1], px[2]
+                        a = px[3] if len(px) > 3 else 255
+                        if a < 128: continue
+                        if g > r+15 and g > b+15 and g > 120:
+                            green_rows.append(y)
+                            break
+            if green_rows:
+                top = max(0, min(green_rows) - 10)
+                bottom = min(h, max(green_rows) + 10)
+            else:
+                top, bottom = 0, h
+
+        # 步骤2：在热力图区域内检测灰色像素
+        total = 0
+        gray = 0
+        step = max(2, min(w, h) // 120)
+        for y in range(top, bottom, step):
+            for x in range(left, right, step):
+                px = rows[y][x]
+                if len(px) >= 3:
+                    a = px[3] if len(px) > 3 else 255
+                    if a < 128: continue
+                    r, g, b = px[0], px[1], px[2]
+                    if r > 240 and g > 240 and b > 240: continue
+                    total += 1
+                    cr = max(r,g,b) - min(r,g,b)
+                    if cr < 25 and 80 < r < 190:
+                        gray += 1
+
+        if total == 0:
+            return 0.0
+        return 100.0 * gray / total
+
+    def _extract_vs_images(self, filepath):
+        """提取 VISUALIZATION STATISTICS 截图并分析热力图区域"""
+        from zipfile import ZipFile
         from xml.etree import ElementTree
-        from collections import OrderedDict
+        from collections import defaultdict
+        from PIL import Image
+        import io, re
 
         NS_W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
         NS_WP = '{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}'
         NS_R = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
-        NS_REL = '{http://schemas.openxmlformats.org/package/2006/relationships}'
 
         with ZipFile(filepath) as z:
-            # 读取文档 XML
+            # 读文档
             xml_content = z.read('word/document.xml')
             root = ElementTree.fromstring(xml_content)
 
-            # 读取关系映射 (rId -> media path)
+            # 读关系映射
             rels_xml = z.read('word/_rels/document.xml.rels')
             rels_root = ElementTree.fromstring(rels_xml)
             rid_map = {}
@@ -1050,41 +1118,55 @@ class ChartColorCheck(AuditRule):
                 rid = rel.get('Id')
                 target = rel.get('Target')
                 if rid and target:
-                    # 关系路径相对 word/ 目录，转成 ZIP 绝对路径
                     if target.startswith('media/'):
                         rid_map[rid] = 'word/' + target
                     else:
                         rid_map[rid] = target
 
-            # 遍历文档元素，跟踪图片归属的章节和频段
+            # 遍历文档，跟踪章节和频段
             section = 'OTHER'
-            band = ''  # '2.4G', '5G', or ''
+            band = ''
             section_media = []  # [(section, band, media_path)]
+
+            def detect_section(text, current_section):
+                lowered = text.lower()
+                if lowered.startswith('name:') or lowered.startswith('mac:') or ', ssid:' in lowered:
+                    return current_section
+                if 'per ap' in lowered:
+                    return 'PER_AP'
+                has_band = bool(re.search(r'\b2[.]?\s*4', lowered) or re.search(r'\b5\s*g', lowered))
+                quals = {'total', 'coverage', 'ssid', 'for', 'per', 'ap'}
+                has_q = any(k in lowered for k in quals)
+                if has_band and ('signal' in lowered or 'snr' in lowered) and not has_q and len(lowered) < 40:
+                    return current_section
+                if 'signal strength' in lowered and 'ssid' in lowered:
+                    return 'SIGNAL_SSID'
+                if 'snr' in lowered and 'ssid' in lowered:
+                    return 'SNR_SSID'
+                if 'signal strength' in lowered:
+                    return 'SIGNAL_TOTAL'
+                if 'snr' in lowered:
+                    return 'SNR_SSID'
+                return current_section
+
+            def detect_band(text):
+                lowered = text.lower()
+                if re.search(r'\b2[.]?\s*4', lowered): return '2.4G'
+                if re.search(r'\b5\s*g', lowered): return '5G'
+                return band
 
             def process_para(para_elem):
                 nonlocal section, band
-                # 检测章节标题
                 texts = []
                 for t in para_elem.iter(NS_W + 't'):
-                    if t.text:
-                        texts.append(t.text)
+                    if t.text: texts.append(t.text)
                 text = ''.join(texts).strip()
                 if text:
-                    lowered = text.lower()
-                    if 'per ap' in lowered:
-                        section = 'PER_AP'
-                    elif 'signal strength' in lowered:
-                        section = 'SIGNAL'
-                    elif 'snr' in lowered:
-                        section = 'SNR'
-                    # 检测频段
-                    if section in ('SIGNAL', 'SNR'):
-                        if re.search(r'\b2[.]?\s*4\s*g', lowered):
-                            band = '2.4G'
-                        elif re.search(r'\b5\s*g', lowered):
-                            band = '5G'
-
-                # 查找段落中的图片
+                    ns = detect_section(text, section)
+                    if ns != section: section = ns
+                    if section in ('SIGNAL_TOTAL','SIGNAL_SSID','SNR_SSID'):
+                        nb = detect_band(text)
+                        if nb: band = nb
                 drawings = list(para_elem.iter(NS_WP + 'inline')) + list(para_elem.iter(NS_WP + 'anchor'))
                 for dw in drawings:
                     for blip in dw.iter('{http://schemas.openxmlformats.org/drawingml/2006/main}blip'):
@@ -1092,109 +1174,54 @@ class ChartColorCheck(AuditRule):
                         if embed and embed in rid_map:
                             section_media.append((section, band, rid_map[embed]))
 
-            # 遍历段落和表格
             for elem in root.iter():
                 tag = elem.tag
-                if tag == NS_W + 'p':
-                    process_para(elem)
+                if tag == NS_W + 'p': process_para(elem)
                 elif tag == NS_W + 'tbl':
-                    # 遍历表格中的段落
-                    for p in elem.iter(NS_W + 'p'):
-                        process_para(p)
+                    for p in elem.iter(NS_W + 'p'): process_para(p)
 
-            # 按文档顺序去重（同一图片可能被多次引用）
-            seen = OrderedDict()
+            # 去重，同组取非白色面积最大的（排除大量空白占位图）
+            seen = {}
             for sec, b, path in section_media:
-                if path not in seen:
-                    seen[path] = (sec, b)
+                key = (sec, b)
+                # 快速评估图片内容：白度 < 60% 才算有效
+                try:
+                    data = z.read(path)
+                    if len(data) < 10000: continue
+                    temp_img = Image.open(io.BytesIO(data)).convert('RGB')
+                    tw, th = temp_img.size
+                    white_px = sum(1 for r,g,b in list(temp_img.getdata())[::100] if r>240 and g>240 and b>240)
+                    white_pct = 100.0 * white_px / max(1, len(list(temp_img.getdata())[::100]))
+                    if white_pct > 60:
+                        continue  # 跳过大量空白图片
+                    content_score = (100 - white_pct) * tw * th  # 非白色内容×总面积
+                except:
+                    content_score = z.getinfo(path).file_size if path in z.namelist() else 0
+                if key not in seen or content_score > seen[key][1]:
+                    seen[key] = (path, content_score)
 
-            # 提取图片进行分析
-            heatmaps = []
-            for path, (sec, b) in seen.items():
-                # 仅分析 SIGNAL 和 SNR 章节的图片
-                if sec not in ('SIGNAL', 'SNR'):
+            # 只保留目标章节，返回图片信息和图像数据
+            result = defaultdict(dict)
+            for (sec, b), (path, _) in seen.items():
+                if sec not in ('SIGNAL_TOTAL', 'SIGNAL_SSID', 'SNR_SSID'):
                     continue
                 data = z.read(path)
-                if len(data) < 10000:
-                    continue
+                if len(data) < 10000: continue
                 try:
                     img = Image.open(io.BytesIO(data))
-                    if img.mode != 'RGBA':
-                        img = img.convert('RGBA')
+                    w, h = img.size
+                    if w < 100 or h < 100: continue
+                    result[sec][b] = {
+                        'name': path.split('/')[-1],
+                        'size': (w, h),
+                        'section': sec,
+                        'band': b,
+                        'img': img.copy(),  # 保存图像供分析
+                    }
                 except:
                     continue
-                w, h = img.size
-                if w < 100 or h < 100:
-                    continue
 
-                legend_info = self._analyze_legend(img, w, h)
-                if legend_info is None:
-                    continue
-                main_info = self._analyze_main_area(img, w, h)
-
-                if sec == 'SIGNAL':
-                    label = f'📶 {b} 信号覆盖热力图' if b else '📶 信号覆盖热力图'
-                else:
-                    label = f'📶 {b} SNR 覆盖热力图' if b else '📶 SNR 覆盖热力图'
-
-                heatmaps.append({
-                    'name': path.split('/')[-1],
-                    'label': label,
-                    'legend': legend_info,
-                    'main': main_info,
-                    'size': (w, h),
-                })
-
-        return heatmaps
-
-    def _analyze_legend(self, img, w, h):
-        lx = max(0, w - 25)
-        zones, pt, ps = [], None, 0
-        for pct in range(0, 100, 2):
-            y = min(int(h * pct / 100), h - 1)
-            rs, gs, bs, n = 0, 0, 0, 0
-            for x in range(lx, w):
-                px = img.getpixel((x, y))
-                a = px[3] if len(px) > 3 else 255
-                if a < 128: continue
-                rs += px[0]; gs += px[1]; bs += px[2]; n += 1
-            if n == 0: zt = 'TRANS'
-            else:
-                r, g, b = rs//n, gs//n, bs//n; cr = max(r,g,b)-min(r,g,b)
-                if cr < 25: zt = 'GRAY'
-                elif g > r+20 and g > b+20 and g > 120: zt = 'GREEN'
-                elif r > g+20 and r > b+20 and r > 120: zt = 'RED'
-                elif r > 180 and g > 160 and b < 150: zt = 'YELLOW'
-                elif r > g+10 and g > 120: zt = 'ORANGE'
-                else: zt = 'MIX'
-            if zt != pt:
-                if pt is not None: zones.append((ps, pct-2, pt))
-                ps, pt = pct, zt
-        if pt is not None: zones.append((ps, 100, pt))
-        nz = [z for z in zones if z[2] not in ('TRANS','GRAY')]
-        if not nz: return None
-        hg = any(z[2]=='GREEN' for z in nz)
-        hr = any(z[2]=='RED' for z in nz)
-        hy = any(z[2] in ('YELLOW','ORANGE') for z in nz)
-        gz = [z for z in nz if z[2]=='GREEN']
-        rz = [z for z in nz if z[2]=='RED']
-        cs = min(z[0] for z in nz); ce = max(z[1] for z in nz)
-        return {'has_green':hg,'has_red':hr,'has_yellow_orange':hy,
-                'green_top_pct':gz[0][0] if gz else 0,
-                'green_bottom_pct':gz[-1][1] if gz else 0,
-                'red_bottom_pct':rz[-1][1] if rz else 0,
-                'color_height_pct':ce-cs}
-
-    def _analyze_main_area(self, img, w, h):
-        gc, ts = 0, 0
-        for y in range(0, h, 4):
-            for x in range(w//4, w*3//4, 4):
-                px = img.getpixel((x, y))
-                a = px[3] if len(px) > 3 else 255
-                if a < 128: continue
-                ts += 1; r, g, b = px[0], px[1], px[2]
-                if max(r,g,b)-min(r,g,b) > 25 and g > r+15 and g > b+15 and g > 120: gc += 1
-        return {'green_pct': (gc/ts*100) if ts else 0}
+            return dict(result)
 
 # ============================================================
 # 3. 审核引擎
