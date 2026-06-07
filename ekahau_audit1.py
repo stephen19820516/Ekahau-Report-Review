@@ -1372,12 +1372,17 @@ def main():
         run_audit_batch(filepaths, expected)
 
 
+import gradio as gr
+
+with gr.Blocks() as demo:
+    gr.Markdown("# Ekahau 报告审核")
+    file = gr.File(label="上传 DOCX")
+    output = gr.Textbox()
+    btn = gr.Button("开始分析")
+    btn.click(analyze_ekahau_docx, inputs=file, outputs=output)
+
 if __name__ == "__main__":
     import os
-    # Render 会自动注入 PORT 环境变量
     port = int(os.environ.get("PORT", 10000))
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=port,
-        share=False
+    demo.launch(server_name="0.0.0.0", server_port=port)
     )
