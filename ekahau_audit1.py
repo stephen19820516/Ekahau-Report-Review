@@ -1373,4 +1373,11 @@ def main():
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=10000)
+    import os
+    # Render 会自动注入 PORT 环境变量
+    port = int(os.environ.get("PORT", 10000))
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=False
+    )
